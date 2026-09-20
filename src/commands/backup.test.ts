@@ -98,7 +98,7 @@ describe("backup commands", () => {
       await mockStateOnlyBackupPlan(path.join(tempHome.home, ".openclaw"));
       const entered = createDeferred();
       const settled = createDeferred();
-      tarCreateMock.mockImplementation(() =>
+      backupWalkMock.mockImplementation(() =>
         createMockTarStream({
           beforeRead: async () => {
             entered.resolve();
