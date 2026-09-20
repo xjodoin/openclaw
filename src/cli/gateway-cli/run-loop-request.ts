@@ -24,3 +24,34 @@ export const sameManagedUpdateOwner = (
   Boolean(
     left && right && left.handoffId === right.handoffId && left.installRoot === right.installRoot,
   );
+
+export function resolveGatewayRunSignalRequestUpgrade(
+  current: GatewayRunSignalRequest | null,
+  incoming: GatewayRunSignalRequest,
+): GatewayRunSignalRequest | undefined {
+  const { action, signal, restartReason, restartIntent } = incoming;
+  if (
+    action === "restart" &&
+    isUpdateProcessRestartReason(restartReason) &&
+    current?.action === "restart" &&
+    (!isUpdateProcessRestartReason(current.restartReason) ||
+      (restartIntent?.successorOwner &&
+        !sameManagedUpdateOwner(
+          restartIntent.successorOwner,
+          current.restartIntent?.successorOwner,
+        )))
+  ) {
+    return {
+      ...current,
+      signal,
+      restartReason,
+      restartIntent: {
+        ...current.restartIntent,
+        ...restartIntent,
+        force: true,
+        reason: restartReason,
+      },
+    };
+  }
+  return undefined;
+}
