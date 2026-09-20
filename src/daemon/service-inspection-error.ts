@@ -92,6 +92,13 @@ export class ServiceDefinitionInspectionError extends Error {
   }
 }
 
+export class GatewayServiceStopUnsafeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GatewayServiceStopUnsafeError";
+  }
+}
+
 export function sanitizeServiceInspectionError(error: unknown): Error {
   return error instanceof ServiceInspectionError ||
     error instanceof ServiceDefinitionInspectionError ||

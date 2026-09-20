@@ -8,6 +8,7 @@ import { GATEWAY_SERVICE_STOP_TIMEOUT_MS } from "../infra/gateway-shutdown-budge
 import { parseKeyValueOutput } from "./runtime-parse.js";
 import {
   isInstallerServiceDescription,
+  isOutdatedGatewayServiceDefinition,
   serviceDefinitionUnknown,
 } from "./service-audit-preservation.js";
 import type {
@@ -269,6 +270,7 @@ async function auditSystemdDefinition(
         parseSystemdTimeSpanMs(value) === parseSystemdTimeSpanMs(expected)
       : value === expected;
   const environment = resolveManagedGatewayServiceCommand(command ?? null)?.environment;
+  const outdatedDefinition = isOutdatedGatewayServiceDefinition(command ?? null);
   const environmentFile = renderSystemdEnvironmentFile(
     resolveSystemdEnvironmentFilePath({
       stateDir: resolveStateDir({ ...env, ...environment }),
@@ -321,9 +323,10 @@ async function auditSystemdDefinition(
         expected !== undefined &&
         (current === undefined ||
           (sourcePath === unitPath &&
-            current.every((value) =>
-              [expected, ...(released[key] ?? [])].some((known) => same(key, value, known)),
-            )));
+            (outdatedDefinition ||
+              current.every((value) =>
+                [expected, ...(released[key] ?? [])].some((known) => same(key, value, known)),
+              ))));
       findings.push(
         recognized
           ? {

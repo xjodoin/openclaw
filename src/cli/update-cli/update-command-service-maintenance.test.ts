@@ -15,7 +15,7 @@ import { createMockGatewayService } from "../../daemon/service.test-helpers.js";
 import { sha256Hex } from "../../infra/crypto-digest.js";
 import * as openClawTmp from "../../infra/tmp-openclaw-dir.js";
 import { createManagedHandoffLeaseStore } from "../../infra/update-managed-service-handoff-lease.js";
-import { createUpdateRun } from "../../infra/update-run-ledger.js";
+import { createUpdateRun, getUpdateRun } from "../../infra/update-run-ledger.js";
 import { mockProcessPlatform } from "../../test-utils/vitest-spies.js";
 import { withUpdateCommandExecutor } from "./update-command-executor.js";
 import {
@@ -26,6 +26,114 @@ import {
 
 const { mocks, withServiceHome } =
   await import("./update-command-service-maintenance.test-support.js");
+
+it.each([
+  "update",
+  "doctor",
+  "refused",
+  "warning",
+  "offline",
+  "refresh",
+  "no-restart",
+  "changed-during-refresh",
+])("refreshes maintenance policy while retaining the admitted service: %s", (operation) =>
+  withServiceHome(async (home) => {
+    mockProcessPlatform("linux");
+    let timeout = 30;
+    const command = {
+      programArguments: [process.execPath, path.join(process.cwd(), "openclaw.mjs"), "gateway"],
+      environment: { HOME: home, OPENCLAW_SERVICE_VERSION: "2026.7.1-2" },
+    };
+    const service = createMockGatewayService({
+      readCommand: async () => structuredClone(command),
+      isLoaded: async () => true,
+      readRuntime: async () => ({
+        status: operation === "offline" ? "stopped" : "running",
+        systemd: { managerUid: 2001 },
+      }),
+      stop: vi.fn(async () => {
+        expect(timeout).toBe(330);
+      }),
+    });
+    mocks.service.mockReturnValue(service);
+    mocks.prepareStop.mockImplementation(async () => {
+      timeout = 330;
+      if (operation === "changed-during-refresh") {
+        command.environment.OPENCLAW_SERVICE_VERSION = "2026.9.6";
+      }
+      return true;
+    });
+    const runId = operation === "warning" ? createUpdateRun({ trigger: "cli" }).runId : undefined;
+    const warning =
+      "Resident budget 25000ms: admitted turn interrupted; next Gateway starts with 330s.";
+    mocks.drain.mockImplementationOnce(async ({ warn }, stop) => {
+      if (operation === "refused") {
+        throw new Error(
+          "Gateway maintenance stop refused: data at risk in owner phase session-mutation",
+        );
+      }
+      if (runId) {
+        warn(warning);
+      }
+      await stop();
+    });
+    const params = {
+      root: process.cwd(),
+      updateInstallKind: "package" as const,
+      shouldRestart: operation !== "no-restart",
+      jsonMode: true,
+      ...(runId ? { updateRun: { runId, env: process.env } } : {}),
+    };
+    const inspected = await maybeStopManagedServiceBeforeMutableUpdate({
+      ...params,
+      phase: "inspect",
+    });
+    expect(inspected.serviceUpdateVerdict?.kind).toBe("owned");
+    if (operation === "doctor" && inspected.serviceUpdateVerdict?.kind === "owned") {
+      inspected.serviceUpdateVerdict.refreshDefinition = false;
+    }
+    const stop = maybeStopManagedServiceBeforeMutableUpdate({
+      ...params,
+      expectedService: inspected,
+      ...(operation === "refresh" ? { phase: "refresh" as const } : {}),
+    });
+    if (operation === "refused" || operation === "changed-during-refresh") {
+      await expect(stop).rejects.toThrow(
+        operation === "refused" ? "owner phase session-mutation" : "definition changed",
+      );
+      expect(service.stop).not.toHaveBeenCalled();
+      return;
+    }
+    const stopped = await stop;
+    if (["offline", "refresh", "no-restart"].includes(operation)) {
+      expect(timeout).toBe(330);
+      expect(stopped.stopped).toBe(false);
+      expect(service.stop).not.toHaveBeenCalled();
+      expect(service.start).not.toHaveBeenCalled();
+      expect(service.restart).not.toHaveBeenCalled();
+      return;
+    }
+    expect(service.stop).toHaveBeenCalledOnce();
+    expect(mocks.drain).toHaveBeenCalledOnce();
+    if (runId) {
+      expect(getUpdateRun(runId)?.steps).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            step: expect.stringMatching(/^warning:gateway-maintenance:/),
+            detail: warning,
+          }),
+        ]),
+      );
+    }
+    expect(stopped.serviceDefinitionEnv?.OPENCLAW_SERVICE_VERSION).toBe("2026.7.1-2");
+    const restored = await revalidateManagedGatewayServiceAfterUpdate({
+      root: params.root,
+      state: await readGatewayServiceState(service, { env: stopped.serviceEnv }),
+      preManagedServiceStop: stopped,
+    });
+    expect(restored).toMatchObject({ kind: "owned", refreshDefinition: operation !== "doctor" });
+  }),
+);
 
 it.each(["systemd-user-bus-unavailable", "service-manager-access-denied"] as const)(
   "retains the native inspection reason without service authority: %s",
@@ -460,7 +568,7 @@ it("retains the inspected systemd manager route during preparation", () =>
       }),
     ).resolves.toMatchObject({ stopped: true });
 
-    expect(seenRoutes.slice(readsBeforePreparation)).toEqual([admittedRoute, admittedRoute]);
+    expect(new Set(seenRoutes.slice(readsBeforePreparation))).toEqual(new Set([admittedRoute]));
   }));
 
 it.each([

@@ -47,7 +47,10 @@ import {
   type GatewayRunSignalAction,
   type GatewayRunSignalRequest,
 } from "./run-loop-request.js";
-import { resolveGatewayShutdownBudget } from "./run-loop-shutdown-budget.js";
+import {
+  resolveGatewayShutdownDrainBudget,
+  resolveGatewayShutdownBudget,
+} from "./run-loop-shutdown-budget.js";
 import { formatDrainCounts, formatShutdownReason } from "./run-loop-shutdown-format.js";
 import {
   createGatewayStartupOperations,
@@ -59,7 +62,6 @@ import {
 } from "./shutdown-hard-exit.js";
 const gatewayLog = createSubsystemLogger("gateway");
 const LAUNCHD_SUPERVISED_RESTART_EXIT_DELAY_MS = 1500;
-const DEFAULT_RESTART_DRAIN_TIMEOUT_MS = 300_000;
 const HARD_EXIT_WATCHDOG_GRACE_MS = 2_000;
 
 type ShutdownFailure = { step: string; error: unknown };
@@ -578,45 +580,47 @@ export async function runGatewayLoop(params: {
     }
     return reacquireAndResumeInProcessRestart();
   };
-  const {
-    nativeStopBudget,
-    restartTimeoutMs,
-    timeoutMs: acceptedShutdownTimeoutMs,
-    reserveMs: RESTART_CLOSE_REPLY_DRAIN_SHUTDOWN_RESERVE_MS,
-    cleanupDeadline,
-    log: logShutdownBudget,
-  } = await resolveGatewayShutdownBudget(supervisorMode, gatewayLog);
-  logShutdownBudget("startup");
+  const startupBudget = await resolveGatewayShutdownBudget(supervisorMode, gatewayLog);
+  let reportedBudget = startupBudget;
+  startupBudget.log("startup");
   const clearPendingStartupForceExitTimer = () => {
     clearTimeout(pendingStartupForceExitTimer ?? undefined);
     pendingStartupForceExitTimer = null;
   };
-  const armPendingStartupForceExitTimer = () => {
-    if (pendingStartupForceExitTimer) {
-      return;
-    }
-    pendingStartupForceExitTimer = setTimeout(() => {
+  const armPendingStartupForceExitTimer = (pendingRequest: GatewayRunSignalRequest) => {
+    // Request admission already coalesces repeated signals before arming.
+    reportedBudget = startupBudget;
+    const expire = () => {
       pendingStartupForceExitTimer = null;
       gatewayLog.error(
         "startup restart request timed out before gateway returned a close handle; exiting for supervisor recovery",
       );
       void forceExitAfterStabilityBundle("gateway.restart_startup_request_timeout");
-    }, acceptedShutdownTimeoutMs);
-    pendingStartupForceExitTimer.unref?.();
-  };
-  const resolveRestartDrainTimeoutMs = (
-    restartIntent?: GatewayRestartIntent,
-  ): number | undefined => {
-    if (restartIntent?.force) {
-      return 0;
-    }
-    if (typeof restartIntent?.waitMs === "number" && Number.isFinite(restartIntent.waitMs)) {
-      return restartIntent.waitMs > 0 ? Math.floor(restartIntent.waitMs) : undefined;
-    }
-    try {
-      return eagerLifecycleRuntime.resolveGatewayRestartDeferralTimeoutMs();
-    } catch {
-      return DEFAULT_RESTART_DRAIN_TIMEOUT_MS;
+    };
+    const arm = (timeoutMs: number) => {
+      const timer = setTimeout(expire, timeoutMs);
+      timer.unref?.();
+      pendingStartupForceExitTimer = timer;
+      return timer;
+    };
+    const timer = arm(startupBudget.timeoutMs);
+    if (process.platform === "linux") {
+      void resolveGatewayShutdownBudget(supervisorMode, gatewayLog, {
+        previous: startupBudget,
+        acceptedAtMs: pendingRequest.acceptedAtMs,
+      })
+        .then((budget) => {
+          // Update upgrades replace the request while retaining this watchdog.
+          if (!pendingStartupRequest || pendingStartupForceExitTimer !== timer) {
+            return;
+          }
+          reportedBudget = budget;
+          clearTimeout(timer);
+          arm(budget.timeoutMs);
+        })
+        .catch((error: unknown) =>
+          gatewayLog.warn(`Startup shutdown budget refresh failed: ${formatErrorMessage(error)}`),
+        );
     }
   };
   const markRestartDraining = (reason: GatewayDrainReason) => {
@@ -687,7 +691,8 @@ export async function runGatewayLoop(params: {
 
   const runAcceptedRequest = (acceptedRequest: GatewayRunSignalRequest) => {
     const { action, restartIntent } = acceptedRequest;
-    logShutdownBudget("shutdown");
+    let budget = startupBudget;
+    reportedBudget = budget;
     const isRestart = action !== "stop";
     const restartWithoutSupervisor = action === "restart" && restartDecision.mode === "disabled";
     const acceptedStartupOperations = startupOperations;
@@ -712,7 +717,7 @@ export async function runGatewayLoop(params: {
       }
       shutdownDeadline = performance.now() + forceExitMs;
       forceExitTimer = setTimeout(() => {
-        const cleanExit = nativeStopBudget && !restartWithoutSupervisor && !shutdownFailure;
+        const cleanExit = budget.nativeStopBudget && !restartWithoutSupervisor && !shutdownFailure;
         gatewayLog.warn(
           `shutdown deadline reached; abandoning unfinished cleanup and active work before ${action}; last observed: ${lastDrainCounts}; exiting ${cleanExit ? "cleanly" : "with incomplete cleanup"}`,
         );
@@ -744,41 +749,45 @@ export async function runGatewayLoop(params: {
       forceActiveRestartExit = () => {
         clearForceExitTimer();
         if (!getManagedUpdateOwner()) {
-          armForceExitTimer(acceptedShutdownTimeoutMs);
+          armForceExitTimer(budget.timeoutMs);
         }
       };
     }
 
     const completion = (async () => {
+      if (process.platform === "linux") {
+        if (budget.nativeStopBudget && !getManagedUpdateOwner()) {
+          armForceExitTimer(budget.timeoutMs);
+        }
+        budget = await resolveGatewayShutdownBudget(supervisorMode, gatewayLog, {
+          previous: startupBudget,
+          acceptedAtMs: acceptedRequest.acceptedAtMs,
+        });
+        if (forcedExitStarted) {
+          return;
+        }
+        reportedBudget = budget;
+        clearForceExitTimer();
+      }
+      budget.log("shutdown");
       let managedUpdateOwner: GatewayRestartIntent["successorOwner"];
       let managedUpdateCancellation:
         | false
         | "restored-in-process"
         | "restart-after-exit"
         | undefined;
-      const requestedRestartDrainTimeoutMs = isRestart
-        ? resolveRestartDrainTimeoutMs(restartIntent)
-        : 0;
-      const restartDrainTimeoutMs = nativeStopBudget
-        ? Math.min(
-            requestedRestartDrainTimeoutMs ?? Infinity,
-            Math.max(0, acceptedShutdownTimeoutMs - RESTART_CLOSE_REPLY_DRAIN_SHUTDOWN_RESERVE_MS),
-          )
-        : requestedRestartDrainTimeoutMs;
-      const restartDrainDeadlineAt =
-        isRestart && restartDrainTimeoutMs !== undefined
-          ? Date.now() + restartDrainTimeoutMs
-          : undefined;
+      const { closeDrainTimeoutMs, restartDrainDeadlineAt, drainTimeoutMs, forceExitMs } =
+        resolveGatewayShutdownDrainBudget({
+          budget,
+          isRestart,
+          restartWithoutSupervisor,
+          restartIntent,
+          resolveDefault: eagerLifecycleRuntime.resolveGatewayRestartDeferralTimeoutMs,
+        });
       // Managed helpers must reach native parking before either exit watchdog can arm.
-      if (!isRestart) {
-        armForceExitTimer(acceptedShutdownTimeoutMs);
-      } else if (restartDrainTimeoutMs !== undefined && !getManagedUpdateOwner()) {
-        armForceExitTimer(restartTimeoutMs(restartDrainTimeoutMs, restartWithoutSupervisor));
+      if (forceExitMs !== undefined && (!isRestart || !getManagedUpdateOwner())) {
+        armForceExitTimer(forceExitMs);
       }
-
-      const drainTimeoutMs = isRestart
-        ? restartDrainTimeoutMs
-        : Math.max(0, acceptedShutdownTimeoutMs - RESTART_CLOSE_REPLY_DRAIN_SHUTDOWN_RESERVE_MS);
       const reportDrainSnapshot = loopLogs.createGatewayDrainReporter(
         action,
         drainTimeoutMs,
@@ -909,17 +918,11 @@ export async function runGatewayLoop(params: {
 
         if (isRestart && !forceExitTimer) {
           armForceExitTimer(
-            nativeStopBudget
-              ? Math.max(0, (restartDrainDeadlineAt ?? Date.now()) - Date.now()) +
-                  RESTART_CLOSE_REPLY_DRAIN_SHUTDOWN_RESERVE_MS
+            budget.nativeStopBudget
+              ? Math.max(0, (restartDrainDeadlineAt ?? Date.now()) - Date.now()) + budget.reserveMs
               : SHUTDOWN_TIMEOUT_MS,
           );
         }
-        const closeDrainTimeoutMs = !isRestart
-          ? null
-          : restartDrainTimeoutMs === undefined
-            ? SHUTDOWN_TIMEOUT_MS - RESTART_CLOSE_REPLY_DRAIN_SHUTDOWN_RESERVE_MS
-            : Math.max(0, (restartDrainDeadlineAt ?? Date.now()) - Date.now());
         if (acceptedRequest.action === "stop") {
           shutdownStep = "startup-operations";
           await acceptedStartupOperations.drain();
@@ -927,14 +930,14 @@ export async function runGatewayLoop(params: {
         shutdownStep = "gateway-server-close";
         await runWithProcessCleanupBudget(
           {
-            deadline: cleanupDeadline(shutdownDeadline!, HARD_EXIT_WATCHDOG_GRACE_MS),
+            deadline: budget.cleanupDeadline(shutdownDeadline!, HARD_EXIT_WATCHDOG_GRACE_MS),
             warn: (message) => gatewayLog.warn(message),
           },
           () =>
             server?.close({
               reason: isRestart ? "gateway restarting" : "gateway stopping",
               restartExpectedMs: isRestart ? 1500 : null,
-              ...(closeDrainTimeoutMs !== null ? { drainTimeoutMs: closeDrainTimeoutMs } : {}),
+              ...(isRestart ? { drainTimeoutMs: closeDrainTimeoutMs() } : {}),
             }),
         );
       } catch (err) {
@@ -1044,6 +1047,7 @@ export async function runGatewayLoop(params: {
     hostedStop?: ReturnType<typeof createGatewayHostLifecycle>,
   ) => {
     const acceptedRequest: GatewayRunSignalRequest = {
+      acceptedAtMs: performance.now(),
       action,
       signal,
       restartReason,
@@ -1134,7 +1138,7 @@ export async function runGatewayLoop(params: {
     }
     if (!server || !restartResolver) {
       pendingStartupRequest = acceptedRequest;
-      armPendingStartupForceExitTimer();
+      armPendingStartupForceExitTimer(acceptedRequest);
       return;
     }
     runAcceptedRequest(acceptedRequest);
@@ -1302,6 +1306,7 @@ export async function runGatewayLoop(params: {
         },
         isCurrent: () => hostLifecycle === iterationHost,
         isServing: () => server !== null && restartResolver !== null && !shuttingDown,
+        getShutdownBudget: () => (shuttingDown ? reportedBudget : startupBudget),
         acceptStop: () =>
           runOutsideGatewayRootWorkAdmission(() =>
             request("stop", "hosted Gateway stop", undefined, undefined, iterationHost),

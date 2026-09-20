@@ -1,6 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
+import { readLifecycleWriteCustody } from "../infra/lifecycle-write-custody.js";
 import { createTestRuntime } from "./test-runtime-config-helpers.js";
 
 const mocks = vi.hoisted(() => ({
@@ -63,6 +65,39 @@ describe("Git backup command agent selection", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
+
+  it.each([false, true])(
+    "retains backup custody through artifact and outcome settlement (failure: %s)",
+    async (fail) => {
+      const entered = createDeferred();
+      const settled = createDeferred();
+      mocks.createGitBackup.mockImplementation(async () => {
+        entered.resolve();
+        await settled.promise;
+        if (fail) {
+          throw new Error("backup failed");
+        }
+        return { commit: "fixture", noChanges: false, pushed: false, warnings: [] };
+      });
+      mocks.recordBackupRunOutcome.mockImplementation(async () => {
+        expect(readLifecycleWriteCustody()).toEqual([{ phase: "backup", count: 1 }]);
+      });
+      const running = backupGitCreateCommand(createTestRuntime(), {
+        repository: "/tmp/repository",
+        global: true,
+      }).catch((error: unknown) => error);
+      await entered.promise;
+      try {
+        expect(readLifecycleWriteCustody()).toEqual([{ phase: "backup", count: 1 }]);
+      } finally {
+        settled.resolve();
+        await running;
+      }
+      const result = await running;
+      expect(result instanceof Error).toBe(fail);
+      expect(readLifecycleWriteCustody()).toEqual([]);
+    },
+  );
 
   it("creates a backup for a configured normalized agent", async () => {
     const agentDir = path.resolve("/tmp/external-agent");

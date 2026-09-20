@@ -4,7 +4,9 @@ import os from "node:os";
 import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
 import { formatCliOperatorError } from "../cli/failure-output.js";
+import { readLifecycleWriteCustody } from "../infra/lifecycle-write-custody.js";
 import type { RuntimeEnv } from "../runtime.js";
 import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
 import { createTempHomeEnv, type TempHomeEnv } from "../test-utils/temp-home.js";
@@ -89,6 +91,38 @@ describe("backup commands", () => {
   afterAll(async () => {
     await tempHome.restore();
   });
+
+  it.each([false, true])(
+    "retains archive custody until the stream settles (failure: %s)",
+    async (fail) => {
+      await mockStateOnlyBackupPlan(path.join(tempHome.home, ".openclaw"));
+      const entered = createDeferred();
+      const settled = createDeferred();
+      tarCreateMock.mockImplementation(() =>
+        createMockTarStream({
+          beforeRead: async () => {
+            entered.resolve();
+            await settled.promise;
+          },
+          ...(fail ? { error: new Error("archive failed") } : {}),
+        }),
+      );
+      const running = backupCreateCommand(createTestRuntime(), {
+        output: path.join(tempHome.home, "backup.tgz"),
+        includeWorkspace: false,
+      }).catch((error: unknown) => error);
+      await entered.promise;
+      try {
+        expect(readLifecycleWriteCustody()).toEqual([{ phase: "backup", count: 1 }]);
+      } finally {
+        settled.resolve();
+        await running;
+      }
+      const result = await running;
+      expect(result instanceof Error).toBe(fail);
+      expect(readLifecycleWriteCustody()).toEqual([]);
+    },
+  );
 
   async function withInvalidWorkspaceBackupConfig<T>(
     raw: string,

@@ -1,5 +1,8 @@
 import { finiteSecondsToTimerSafeMilliseconds } from "@openclaw/normalization-core/number-coercion";
+import { beginLifecycleWriteCustody } from "../infra/lifecycle-write-custody.js";
+import { withCommandProcessScope } from "../process/exec-spawn.js";
 import { runCommandWithTimeout } from "../process/exec.js";
+import { isScheduledBackupCommand } from "./backup-command.js";
 import {
   buildCronCommandSummary,
   isCronCommandActionCriticalLine,
@@ -97,18 +100,23 @@ export async function runCronCommandJob(params: {
 
   const command = formatCommand(payload.argv);
   const noOutputTimeoutMs = secondsToMs(payload.noOutputTimeoutSeconds);
+  const releaseCustody = isScheduledBackupCommand(params.job)
+    ? beginLifecycleWriteCustody("backup")
+    : undefined;
   try {
-    const result = await runCommandWithTimeout(payload.argv, {
-      timeoutMs: secondsToMs(payload.timeoutSeconds) ?? DEFAULT_COMMAND_TIMEOUT_MS,
-      ...(payload.cwd ? { cwd: payload.cwd } : {}),
-      ...(payload.input !== undefined ? { input: payload.input } : {}),
-      ...(payload.env ? { env: payload.env } : {}),
-      ...(noOutputTimeoutMs !== undefined ? { noOutputTimeoutMs } : {}),
-      ...(payload.outputMaxBytes !== undefined ? { maxOutputBytes: payload.outputMaxBytes } : {}),
-      preserveOutputLine: isCronCommandActionCriticalLine,
-      ...(params.abortSignal ? { signal: params.abortSignal } : {}),
-      killProcessTree: true,
-    });
+    const result = await withCommandProcessScope(() =>
+      runCommandWithTimeout(payload.argv, {
+        timeoutMs: secondsToMs(payload.timeoutSeconds) ?? DEFAULT_COMMAND_TIMEOUT_MS,
+        ...(payload.cwd ? { cwd: payload.cwd } : {}),
+        ...(payload.input !== undefined ? { input: payload.input } : {}),
+        ...(payload.env ? { env: payload.env } : {}),
+        ...(noOutputTimeoutMs !== undefined ? { noOutputTimeoutMs } : {}),
+        ...(payload.outputMaxBytes !== undefined ? { maxOutputBytes: payload.outputMaxBytes } : {}),
+        preserveOutputLine: isCronCommandActionCriticalLine,
+        ...(params.abortSignal ? { signal: params.abortSignal } : {}),
+        killProcessTree: true,
+      }),
+    );
     const termination =
       result.termination === "signal" &&
       params.abortSignal?.reason instanceof Error &&
@@ -188,5 +196,7 @@ export async function runCronCommandJob(params: {
         ],
       },
     };
+  } finally {
+    releaseCustody?.();
   }
 }

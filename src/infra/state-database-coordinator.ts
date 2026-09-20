@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type { MessagePort } from "node:worker_threads";
 import { resolveGlobalSingleton } from "../shared/global-singleton.js";
+import { beginLifecycleWriteCustody } from "./lifecycle-write-custody.js";
 import {
   createSqliteLifecycleAggregateError,
   ensurePrivateSqliteCoordinatorDirectory,
@@ -603,6 +604,7 @@ export function acquireStateDatabaseHandleExclusion(params: CoordinatorOptions) 
           }
           scope.assertCurrent();
         }, signal);
+      const releaseCustody = beginLifecycleWriteCustody("coordinator-write");
       try {
         scope.assertCurrent();
         const result = await canonicalWriteScopes.run(scopes, operation);
@@ -613,6 +615,7 @@ export function acquireStateDatabaseHandleExclusion(params: CoordinatorOptions) 
         // An escaped operation cannot use this context after the owner returns.
         scope.active = false;
         await Promise.allSettled(snapshots);
+        releaseCustody();
         retained.release();
       }
     },

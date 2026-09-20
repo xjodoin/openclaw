@@ -21,6 +21,7 @@ export async function auditLaunchdDefinition(
   findings: ServiceDefinitionDrift[],
   timeoutMs?: number,
   inspectRewrite = false,
+  outdatedDefinition = false,
 ): Promise<void> {
   const sourcePath = resolveLaunchAgentPlistPath(env);
   const content = (await readExistingLaunchAgentPlist(sourcePath))?.contents ?? null;
@@ -96,7 +97,12 @@ export async function auditLaunchdDefinition(
     if (
       value !== undefined &&
       key !== "Label" &&
-      (current === undefined || (typeof current === "string" && released[key]?.includes(current)))
+      (current === undefined ||
+        (outdatedDefinition &&
+          (typeof current === "string" ||
+            typeof current === "number" ||
+            typeof current === "boolean")) ||
+        (typeof current === "string" && released[key]?.includes(current)))
     ) {
       findings.push({
         kind: "outdated",

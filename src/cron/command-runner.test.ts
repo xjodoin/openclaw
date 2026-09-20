@@ -2,11 +2,15 @@ import type { ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../test/helpers/promise.js";
+import { readLifecycleWriteCustody } from "../infra/lifecycle-write-custody.js";
+import type { SpawnResult } from "../process/exec-result.js";
 import * as execSpawn from "../process/exec-spawn.js";
 import * as processExecution from "../process/exec.js";
 import { isPidAlive } from "../shared/pid-alive.js";
 import { readPidFile, waitForPidToExit } from "../test-utils/process-tree.js";
 import { withTempDir } from "../test-utils/temp-dir.js";
+import { SCHEDULED_BACKUP_COMMAND, SCHEDULED_BACKUP_DECLARATION_KEY } from "./backup-command.js";
 import { runCronCommandJob } from "./command-runner.js";
 import type { CronJob } from "./types.js";
 
@@ -27,6 +31,89 @@ function makeCommandJob(payload: Extract<CronJob["payload"], { kind: "command" }
 }
 
 describe("runCronCommandJob", () => {
+  it.each(["owned", "display-only", "retargeted"])(
+    "records only declared backup command custody through native settlement: %s",
+    async (mode) => {
+      const settled = createDeferred<SpawnResult>();
+      const runCommand = vi
+        .spyOn(processExecution, "runCommandWithTimeout")
+        .mockReturnValue(settled.promise);
+      const job = makeCommandJob({
+        kind: "command",
+        argv: mode === "retargeted" ? ["echo", "backup"] : [...SCHEDULED_BACKUP_COMMAND],
+      });
+      job.name = SCHEDULED_BACKUP_DECLARATION_KEY;
+      if (mode !== "display-only") {
+        job.declarationKey = SCHEDULED_BACKUP_DECLARATION_KEY;
+      }
+      const ownsBackup = mode !== "display-only" && mode !== "retargeted";
+      const running = runCronCommandJob({ job });
+      try {
+        expect(readLifecycleWriteCustody()).toEqual(
+          ownsBackup ? [{ phase: "backup", count: 1 }] : [],
+        );
+        settled.resolve({
+          code: null,
+          signal: "SIGTERM",
+          killed: true,
+          stdout: "",
+          stderr: "",
+          termination: "timeout",
+          cleanup: "forced",
+        });
+        expect((await running).status).toBe("error");
+        expect(readLifecycleWriteCustody()).toEqual([]);
+      } finally {
+        settled.resolve({
+          code: 0,
+          signal: null,
+          killed: false,
+          stdout: "",
+          stderr: "",
+          termination: "exit",
+        });
+        await running;
+        runCommand.mockRestore();
+      }
+    },
+  );
+
+  it.each(["normal", "uncertain"] as const)(
+    "joins declared backup cleanup and releases its fact after settled %s cleanup",
+    async (outcome) => {
+      const cleanup = createDeferred<SpawnResult["cleanup"]>();
+      const response = Promise.resolve<SpawnResult>({
+        code: null,
+        signal: "SIGTERM",
+        killed: true,
+        stdout: "",
+        stderr: "",
+        termination: "signal",
+        cleanup: "uncertain",
+      });
+      const runCommand = vi
+        .spyOn(processExecution, "runCommandWithTimeout")
+        .mockImplementation(() => {
+          execSpawn.retainCommandProcessCleanup(cleanup.promise);
+          return response;
+        });
+      const job = makeCommandJob({ kind: "command", argv: [...SCHEDULED_BACKUP_COMMAND] });
+      job.declarationKey = SCHEDULED_BACKUP_DECLARATION_KEY;
+      const running = runCronCommandJob({ job });
+      try {
+        await response;
+        expect(readLifecycleWriteCustody()).toEqual([{ phase: "backup", count: 1 }]);
+        cleanup.resolve(outcome);
+        expect((await running).status).toBe("error");
+        expect(readLifecycleWriteCustody()).toEqual([]);
+      } finally {
+        cleanup.resolve("normal");
+        await running;
+        runCommand.mockRestore();
+      }
+    },
+  );
+
   it("runs command argv and returns stdout as the deliverable summary", async () => {
     const result = await runCronCommandJob({
       job: makeCommandJob({

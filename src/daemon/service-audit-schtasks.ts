@@ -35,6 +35,7 @@ export async function auditScheduledTaskDefinition(
   timeoutMs?: number,
   expectedCommand?: GatewayServiceExpectedCommand,
   expectedXml?: string,
+  outdatedDefinition = false,
 ): Promise<string> {
   const sourcePath = resolveTaskScriptPath(env);
   const hiddenPath = resolveTaskLauncherScriptPath(
@@ -182,7 +183,13 @@ export async function auditScheduledTaskDefinition(
     ) {
       continue;
     }
-    if (canonical && released[key] === current) {
+    if (
+      canonical &&
+      (released[key] === current ||
+        (!expectedXml &&
+          outdatedDefinition &&
+          (key.startsWith("Settings.") || key === "Triggers.LogonTrigger.Enabled")))
+    ) {
       outdated(key, current, canonical.textContent);
     } else {
       unknown(key, "The key or value is not a recognized installer setting.");

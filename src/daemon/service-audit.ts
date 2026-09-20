@@ -6,7 +6,10 @@ import { resolveInlineCommandMatch } from "../infra/shell-inline-command.js";
 import { POSIX_SHELL_WRAPPERS } from "../infra/shell-wrapper-resolution.js";
 import { parseTcpPort } from "../infra/tcp-port.js";
 import { auditLaunchdDefinition } from "./service-audit-launchd.js";
-import { auditGatewayInstallPreservation } from "./service-audit-preservation.js";
+import {
+  auditGatewayInstallPreservation,
+  isOutdatedGatewayServiceDefinition,
+} from "./service-audit-preservation.js";
 import { auditGatewayRuntime, SERVICE_RUNTIME_AUDIT_CODES } from "./service-audit-runtime.js";
 import { auditScheduledTaskDefinition } from "./service-audit-schtasks.js";
 import { auditSystemdUnit, SYSTEMD_SERVICE_AUDIT_CODES } from "./service-audit-systemd.js";
@@ -447,6 +450,7 @@ export async function auditGatewayServiceConfig(params: {
         definitionDrift,
         params.timeoutMs,
         Boolean(params.expectedCommand),
+        isOutdatedGatewayServiceDefinition(params.command),
       );
     } else if (platform === "win32" && params.command) {
       await auditScheduledTaskDefinition(
@@ -454,6 +458,8 @@ export async function auditGatewayServiceConfig(params: {
         definitionDrift,
         params.timeoutMs,
         params.expectedCommand,
+        undefined,
+        isOutdatedGatewayServiceDefinition(params.command),
       );
     }
   } catch {

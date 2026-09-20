@@ -5,6 +5,7 @@ import type { createGatewayHostLifecycle } from "./host-lifecycle.js";
 export type GatewayRunSignalAction = "stop" | "restart" | "external-restart";
 
 export type GatewayRunSignalRequest = {
+  acceptedAtMs: number;
   action: GatewayRunSignalAction;
   signal: GatewayShutdownTrigger;
   restartReason?: string;
