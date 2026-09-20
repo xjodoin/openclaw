@@ -19,6 +19,7 @@ import {
   STARTUP_MIGRATION_LEASE_TTL_MS,
 } from "../../infra/startup-migration-checkpoint.js";
 import { isPidAlive } from "../../shared/pid-alive.js";
+import type { OpenClawStateSchemaReadAdmission } from "../../state/openclaw-state-db-contract.js";
 import { sleep } from "../../utils.js";
 import {
   confirmGatewayReachable,
@@ -102,6 +103,7 @@ export async function inspectGatewayRestart(params: {
   env?: NodeJS.ProcessEnv;
   expectedVersion?: string | null;
   expectedBuildId?: string | null;
+  openStateSchemaReadAdmission?: OpenClawStateSchemaReadAdmission;
   requirePluginHealth?: boolean;
   probeContext?: GatewayRestartProbeContext;
   configuredProbe?: ConfiguredGatewayLocalProbe;
@@ -256,7 +258,15 @@ export async function inspectGatewayRestart(params: {
   }
   // Read after probes: an owner can acquire the coordinator while health is unavailable.
   const owner =
-    portUsage.status === "busy" ? readGatewayOwnerLease({ env, port: params.port }) : undefined;
+    portUsage.status === "busy"
+      ? readGatewayOwnerLease({
+          env,
+          port: params.port,
+          ...(params.openStateSchemaReadAdmission
+            ? { openStateSchemaReadAdmission: params.openStateSchemaReadAdmission }
+            : {}),
+        })
+      : undefined;
   // A recorded owner is never stale by PID inference; other listeners are foreign.
   // 2026.9.3 Gateways have no row and retain the installed-runtime ownership path.
   const staleGatewayPids = owner
